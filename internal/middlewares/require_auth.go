@@ -6,6 +6,7 @@ import (
 	"github.com/authelia/authelia/v4/internal/authentication"
 	"github.com/authelia/authelia/v4/internal/model"
 	"github.com/authelia/authelia/v4/internal/session"
+	"github.com/authelia/authelia/v4/internal/utils"
 )
 
 // Require1FA check if user has enough permissions to execute the next handler.
@@ -133,4 +134,35 @@ func handleRequireElevatedShouldDoNextValidate(ctx *AutheliaCtx, userSession *se
 	}
 
 	return true
+}
+
+// RequireAdminsGroup checks if user has admin privileges by being in the 'admins' group.
+func RequireAdminsGroup(next RequestHandler) RequestHandler {
+	return func(ctx *AutheliaCtx) {
+		var (
+			userSession session.UserSession
+			err         error
+		)
+
+		if userSession, err = ctx.GetSession(); err != nil {
+			ctx.Logger.WithError(err).Error("Error occurred attempting to lookup user session during admin check.")
+			ctx.ReplyForbidden()
+			return
+		}
+
+		if userSession.AuthenticationLevel(ctx.Configuration.WebAuthn.EnablePasskey2FA) < authentication.TwoFactor {
+			ctx.Logger.Warn("A user without sufficient authentication level attempted to access an admin protected endpoint.")
+			ctx.ReplyForbidden()
+			return
+		}
+
+		// Check if user is in admins group
+		if !utils.IsStringInSlice("admins", userSession.Groups) {
+			ctx.Logger.WithFields(map[string]any{"user": userSession.Username, "groups": userSession.Groups}).Warn("A user without admin privileges attempted to access an admin protected endpoint.")
+			ctx.ReplyForbidden()
+			return
+		}
+
+		next(ctx)
+	}
 }

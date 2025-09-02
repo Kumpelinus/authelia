@@ -266,6 +266,14 @@ func handlerMain(config *schema.Configuration, providers middlewares.Providers) 
 
 		r.POST("/api/reset-password", middlewareAPI(handlers.ResetPasswordPOST))
 		r.DELETE("/api/reset-password", middlewareAPI(resetPasswordTokenRL(handlers.ResetPasswordDELETE)))
+
+		// Admin password reset endpoint (requires admin group membership and 2FA)
+		middlewareAdmin := middlewares.NewBridgeBuilder(*config, providers).
+			WithPreMiddlewares(middlewares.SecurityHeadersBase, middlewares.SecurityHeadersNoStore, middlewares.SecurityHeadersCSPNone).
+			WithPostMiddlewares(middlewares.NewRateLimit(config.Server.Endpoints.RateLimits.ResetPasswordStart), middlewares.RequireAdminsGroup).
+			Build()
+		
+		r.POST("/api/admin-reset-password", middlewareAdmin(handlers.AdminResetPasswordPOST))
 	}
 
 	if !config.AuthenticationBackend.PasswordChange.Disable {

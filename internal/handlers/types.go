@@ -242,3 +242,18 @@ type handlerAuthorizationConsent func(
 	userSession session.UserSession, subject uuid.UUID,
 	rw http.ResponseWriter, r *http.Request,
 	requester oauthelia2.Requester) (consent *model.OAuth2ConsentSession, handled bool)
+
+// bodyAdminResetPasswordRequest represents the request body for the admin reset password endpoint.
+type bodyAdminResetPasswordRequest struct {
+	Username   string `json:"username" valid:"required"`
+	TTLSeconds *int   `json:"ttl_seconds,omitempty"`
+	Silent     *bool  `json:"silent,omitempty"`
+}
+
+// bodyAdminResetPasswordResponse represents the response body for the admin reset password endpoint.
+type bodyAdminResetPasswordResponse struct {
+	Token     string `json:"token"`
+	Link      string `json:"link"`
+	ExpiresAt string `json:"expires_at"`
+	JTI       string `json:"jti"`
+}

@@ -4,9 +4,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
+	"github.com/valyala/fasthttp"
 
 	"github.com/authelia/authelia/v4/internal/middlewares"
 	"github.com/authelia/authelia/v4/internal/model"
@@ -275,3 +278,141 @@ func resetPasswordIdentityVerificationFinish(ctx *middlewares.AutheliaCtx, usern
 // ResetPasswordIdentityFinish the handler for finishing the identity validation.
 var ResetPasswordIdentityFinish = middlewares.IdentityVerificationFinish(
 	middlewares.IdentityVerificationFinishArgs{ActionClaim: ActionResetPassword}, resetPasswordIdentityVerificationFinish)
+
+// createIdentityVerificationToken creates a signed JWT token for identity verification.
+func createIdentityVerificationToken(ctx *middlewares.AutheliaCtx, username, action string, ttl time.Duration) (token string, verification model.IdentityVerification, err error) {
+	var jti uuid.UUID
+	if jti, err = uuid.NewRandom(); err != nil {
+		return "", model.IdentityVerification{}, err
+	}
+
+	verification = model.NewIdentityVerification(jti, username, action, ctx.RemoteIP(), ttl)
+	claims := verification.ToIdentityVerificationClaim()
+
+	// Determine signing method
+	var method *jwt.SigningMethodHMAC
+	switch ctx.Configuration.IdentityValidation.ResetPassword.JWTAlgorithm {
+	case "HS256":
+		method = jwt.SigningMethodHS256
+	case "HS384":
+		method = jwt.SigningMethodHS384
+	case "HS512":
+		method = jwt.SigningMethodHS512
+	default:
+		method = jwt.SigningMethodHS256
+	}
+
+	// Sign the JWT token
+	tokenObj := jwt.NewWithClaims(method, claims)
+	token, err = tokenObj.SignedString([]byte(ctx.Configuration.IdentityValidation.ResetPassword.JWTSecret))
+	
+	return token, verification, err
+}
+
+// AdminResetPasswordPOST handler for admin-initiated password reset.
+func AdminResetPasswordPOST(ctx *middlewares.AutheliaCtx) {
+	var (
+		requestBody bodyAdminResetPasswordRequest
+		err         error
+	)
+
+	if err = ctx.ParseBody(&requestBody); err != nil {
+		ctx.Error(fmt.Errorf("error occurred parsing admin reset password body: %w", err), messageOperationFailed)
+		return
+	}
+
+	// Get user details
+	details, err := ctx.Providers.UserProvider.GetDetails(requestBody.Username)
+	if err != nil {
+		ctx.Logger.WithError(err).WithField("user", requestBody.Username).Error("Error occurred looking up user for admin password reset")
+		ctx.Error(err, messageOperationFailed)
+		return
+	}
+
+	if len(details.Emails) == 0 {
+		ctx.Logger.WithField("user", requestBody.Username).Error("User has no email address configured for admin password reset")
+		ctx.Error(fmt.Errorf("user %s has no email address configured", requestBody.Username), messageOperationFailed)
+		return
+	}
+
+	// Determine TTL - clamp to maximum if provided, otherwise use default
+	ttl := ctx.Configuration.IdentityValidation.ResetPassword.JWTExpiration
+	if requestBody.TTLSeconds != nil {
+		// Convert to time.Duration and clamp to configured maximum
+		requestedTTL := time.Duration(*requestBody.TTLSeconds) * time.Second
+		maxTTL := ctx.Configuration.IdentityValidation.ResetPassword.JWTExpiration
+		if requestedTTL > 0 && requestedTTL < maxTTL {
+			ttl = requestedTTL
+		}
+	}
+
+	// Create identity verification token
+	signedToken, verification, err := createIdentityVerificationToken(ctx, requestBody.Username, ActionResetPassword, ttl)
+	if err != nil {
+		ctx.Error(err, messageOperationFailed)
+		return
+	}
+
+	// Save verification record to database
+	if err = ctx.Providers.StorageProvider.SaveIdentityVerification(ctx, verification); err != nil {
+		ctx.Error(err, messageOperationFailed)
+		return
+	}
+
+	// Generate reset link
+	linkURL := ctx.RootURL()
+	query := linkURL.Query()
+	query.Set("token", signedToken)
+	linkURL.Path = path.Join(linkURL.Path, "/reset-password/step2")
+	linkURL.RawQuery = query.Encode()
+
+	// Send notification if not in silent mode
+	silent := requestBody.Silent != nil && *requestBody.Silent
+	if !silent {
+		domain, _ := ctx.GetCookieDomain()
+
+		data := templates.EmailIdentityVerificationJWTValues{
+			Title:       "Admin initiated password reset",
+			LinkURL:     linkURL.String(),
+			LinkText:    "Reset Password",
+			DisplayName: details.DisplayName,
+			Domain:      domain,
+			RemoteIP:    ctx.RemoteIP().String(),
+		}
+
+		addresses := details.Addresses()
+		ctx.Logger.Debugf("Sending admin-initiated password reset email to user %s (%s)",
+			requestBody.Username, addresses[0].String())
+
+		if err = ctx.Providers.Notifier.Send(ctx, addresses[0], "Admin initiated password reset", ctx.Providers.Templates.GetIdentityVerificationJWTEmailTemplate(), data); err != nil {
+			ctx.Logger.WithError(err).Error("Error occurred sending admin password reset notification")
+			// Don't fail the request if notification fails
+		}
+	}
+
+	// Audit log
+	userSession, _ := ctx.GetSession()
+	adminUsername := ""
+	if userSession.Username != "" {
+		adminUsername = userSession.Username
+	}
+	
+	ctx.Logger.WithFields(map[string]any{
+		"user":     requestBody.Username,
+		"admin":    adminUsername,
+		"silent":   silent,
+		"jti":      verification.JTI.String(),
+		"remoteip": ctx.RemoteIP().String(),
+	}).Info("Admin initiated password reset")
+
+	// Return response
+	response := bodyAdminResetPasswordResponse{
+		Token:     signedToken,
+		Link:      linkURL.String(),
+		ExpiresAt: verification.ExpiresAt.Format(time.RFC3339),
+		JTI:       verification.JTI.String(),
+	}
+
+	ctx.SetStatusCode(fasthttp.StatusCreated)
+	ctx.ReplyJSON(response, fasthttp.StatusCreated)
+}
