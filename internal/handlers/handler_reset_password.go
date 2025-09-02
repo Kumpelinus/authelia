@@ -279,6 +279,36 @@ func resetPasswordIdentityVerificationFinish(ctx *middlewares.AutheliaCtx, usern
 var ResetPasswordIdentityFinish = middlewares.IdentityVerificationFinish(
 	middlewares.IdentityVerificationFinishArgs{ActionClaim: ActionResetPassword}, resetPasswordIdentityVerificationFinish)
 
+// createIdentityVerificationToken creates a signed JWT token for identity verification.
+func createIdentityVerificationToken(ctx *middlewares.AutheliaCtx, username, action string, ttl time.Duration) (token string, verification model.IdentityVerification, err error) {
+	var jti uuid.UUID
+	if jti, err = uuid.NewRandom(); err != nil {
+		return "", model.IdentityVerification{}, err
+	}
+
+	verification = model.NewIdentityVerification(jti, username, action, ctx.RemoteIP(), ttl)
+	claims := verification.ToIdentityVerificationClaim()
+
+	// Determine signing method
+	var method *jwt.SigningMethodHMAC
+	switch ctx.Configuration.IdentityValidation.ResetPassword.JWTAlgorithm {
+	case "HS256":
+		method = jwt.SigningMethodHS256
+	case "HS384":
+		method = jwt.SigningMethodHS384
+	case "HS512":
+		method = jwt.SigningMethodHS512
+	default:
+		method = jwt.SigningMethodHS256
+	}
+
+	// Sign the JWT token
+	tokenObj := jwt.NewWithClaims(method, claims)
+	token, err = tokenObj.SignedString([]byte(ctx.Configuration.IdentityValidation.ResetPassword.JWTSecret))
+	
+	return token, verification, err
+}
+
 // AdminResetPasswordPOST handler for admin-initiated password reset.
 func AdminResetPasswordPOST(ctx *middlewares.AutheliaCtx) {
 	var (
@@ -305,13 +335,6 @@ func AdminResetPasswordPOST(ctx *middlewares.AutheliaCtx) {
 		return
 	}
 
-	// Generate JWT token ID
-	var jti uuid.UUID
-	if jti, err = uuid.NewRandom(); err != nil {
-		ctx.Error(err, messageOperationFailed)
-		return
-	}
-
 	// Determine TTL - clamp to maximum if provided, otherwise use default
 	ttl := ctx.Configuration.IdentityValidation.ResetPassword.JWTExpiration
 	if requestBody.TTLSeconds != nil {
@@ -323,28 +346,8 @@ func AdminResetPasswordPOST(ctx *middlewares.AutheliaCtx) {
 		}
 	}
 
-	// Create identity verification record
-	verification := model.NewIdentityVerification(jti, requestBody.Username, ActionResetPassword, ctx.RemoteIP(), ttl)
-
-	// Create JWT claims
-	claims := verification.ToIdentityVerificationClaim()
-
-	// Determine signing method
-	var method *jwt.SigningMethodHMAC
-	switch ctx.Configuration.IdentityValidation.ResetPassword.JWTAlgorithm {
-	case "HS256":
-		method = jwt.SigningMethodHS256
-	case "HS384":
-		method = jwt.SigningMethodHS384
-	case "HS512":
-		method = jwt.SigningMethodHS512
-	default:
-		method = jwt.SigningMethodHS256
-	}
-
-	// Sign the JWT token
-	token := jwt.NewWithClaims(method, claims)
-	signedToken, err := token.SignedString([]byte(ctx.Configuration.IdentityValidation.ResetPassword.JWTSecret))
+	// Create identity verification token
+	signedToken, verification, err := createIdentityVerificationToken(ctx, requestBody.Username, ActionResetPassword, ttl)
 	if err != nil {
 		ctx.Error(err, messageOperationFailed)
 		return
@@ -398,7 +401,7 @@ func AdminResetPasswordPOST(ctx *middlewares.AutheliaCtx) {
 		"user":     requestBody.Username,
 		"admin":    adminUsername,
 		"silent":   silent,
-		"jti":      jti.String(),
+		"jti":      verification.JTI.String(),
 		"remoteip": ctx.RemoteIP().String(),
 	}).Info("Admin initiated password reset")
 
@@ -407,7 +410,7 @@ func AdminResetPasswordPOST(ctx *middlewares.AutheliaCtx) {
 		Token:     signedToken,
 		Link:      linkURL.String(),
 		ExpiresAt: verification.ExpiresAt.Format(time.RFC3339),
-		JTI:       jti.String(),
+		JTI:       verification.JTI.String(),
 	}
 
 	ctx.SetStatusCode(fasthttp.StatusCreated)

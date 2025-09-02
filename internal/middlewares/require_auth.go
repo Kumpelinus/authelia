@@ -6,6 +6,7 @@ import (
 	"github.com/authelia/authelia/v4/internal/authentication"
 	"github.com/authelia/authelia/v4/internal/model"
 	"github.com/authelia/authelia/v4/internal/session"
+	"github.com/authelia/authelia/v4/internal/utils"
 )
 
 // Require1FA check if user has enough permissions to execute the next handler.
@@ -156,15 +157,7 @@ func RequireAdminsGroup(next RequestHandler) RequestHandler {
 		}
 
 		// Check if user is in admins group
-		hasAdminAccess := false
-		for _, group := range userSession.Groups {
-			if group == "admins" {
-				hasAdminAccess = true
-				break
-			}
-		}
-
-		if !hasAdminAccess {
+		if !utils.IsStringInSlice("admins", userSession.Groups) {
 			ctx.Logger.WithFields(map[string]any{"user": userSession.Username, "groups": userSession.Groups}).Warn("A user without admin privileges attempted to access an admin protected endpoint.")
 			ctx.ReplyForbidden()
 			return
